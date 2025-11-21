@@ -1,0 +1,11 @@
+/* This file imports the necessary Tailwind CSS directives. 
+It must be present in the src/ directory to satisfy the import in index.js.
+*/
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* You can add any custom global styles here */
+body {
+    font-family: 'Inter', sans-serif;
+}
