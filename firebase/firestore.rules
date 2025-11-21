@@ -1,1 +1,32 @@
+rules_version = '2';service cloud.firestore {match /databases/{database}/documents {// --- Configuration/Meta-data Rule ---
+// Allows public read of core config data needed by all users.
+match /artifacts/{appId}/public/data/config/{docId} {
+  allow read: if true;
+}
 
+// --- Public Store/Catalog Rule ---
+// Allows Read by any authenticated user for the store catalog data.
+// Write access is restricted to authenticated users who also have the 'admin_user' role.
+match /artifacts/{appId}/public/data/stores/{storeId} {
+  allow read: if request.auth != null;
+  allow create, update, delete: if request.auth != null && exists(/databases/$(database)/documents/artifacts/$(appId)/users/$(request.auth.uid)/roles/admin_user);
+}
+
+// --- User-Specific Private Data (e.g., Orders) ---
+// Allows a user to read/write their own data in their private collection.
+match /artifacts/{appId}/users/{userId}/{document=**} {
+  allow read, write: if request.auth != null && request.auth.uid == userId;
+}
+
+// --- Admin Role Assignment (Used to enforce the rule above) ---
+match /artifacts/{appId}/users/{userId}/roles/{roleId} {
+  allow read: if request.auth != null;
+  // Admin creation must be done via a trusted backend/Cloud Function, not client-side.
+  allow write: if false; 
+}
+
+// --- Default Deny Rule ---
+match /{document=**} {
+  allow read, write: if false;
+}
+}}
