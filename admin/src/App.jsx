@@ -8,9 +8,9 @@ import { Package, PlusCircle, Loader2, DollarSign, List, XCircle, Users } from '
 // 1. FIREBASE SETUP
 // ----------------------
 
-// Fallback configuration for external (Render) deployment
-// NOTE: For security in a real application, you would use Render Environment Variables 
-// instead of hardcoding a mock config.
+// *** CRITICAL FALLBACK CONFIGURATION FOR EXTERNAL DEPLOYMENT ***
+// This mock config ensures the app loads when run on Render/public URLs 
+// where the Canvas-injected variables are missing.
 const FALLBACK_FIREBASE_CONFIG = {
     apiKey: "MOCK_API_KEY", 
     authDomain: "mock-auth-domain.firebaseapp.com",
@@ -28,17 +28,22 @@ const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial
 
 let firebaseConfig;
 try {
+    // Attempt to use the platform config first
     firebaseConfig = typeof __firebase_config !== 'undefined' && __firebase_config 
         ? JSON.parse(__firebase_config) 
         : FALLBACK_FIREBASE_CONFIG;
 } catch (e) {
+    // Fallback if parsing fails
     firebaseConfig = FALLBACK_FIREBASE_CONFIG;
 }
 
 // The collection path for public data (products)
 const getProductCollectionPath = (appId) => `/artifacts/${appId}/public/data/products`;
 
-setLogLevel('error'); // Set log level to reduce console noise unless debugging
+setLogLevel('error'); 
+// Ensure we track if we are using the fallback config
+const isFallback = firebaseConfig === FALLBACK_FIREBASE_CONFIG;
+
 
 let app;
 let db;
@@ -106,7 +111,8 @@ const App = () => {
       return () => unsubscribeAuth();
     } catch (e) {
       console.error("Firebase Init Error:", e);
-      setError(`Initialization Error: ${e.message}.`);
+      // The error you were seeing before should be caught here:
+      setError(`Initialization Error: ${e.message}. The Firebase config was invalid.`);
       setIsAuthReady(true); 
     }
   }, []);
@@ -116,7 +122,10 @@ const App = () => {
     // Only proceed if Firebase is initialized and Auth is ready
     if (!isAuthReady || !db || !userId || error) return;
 
-    const productsRef = collection(db, getProductCollectionPath(appId));
+    // Use the actual appId or the default fallback ID for the data path
+    const dataAppId = isFallback ? DEFAULT_APP_ID : appId;
+
+    const productsRef = collection(db, getProductCollectionPath(dataAppId));
     const productsQuery = query(productsRef);
 
     // Set up real-time listener for products
@@ -130,7 +139,6 @@ const App = () => {
         setLoading(false);
       } catch (e) {
         console.error("Firestore Snapshot Error:", e);
-        // This often happens if security rules are too restrictive for anonymous users
         setError(`Data fetch failed: ${e.message}. Please verify Firestore rules.`);
         setLoading(false);
       }
@@ -142,7 +150,7 @@ const App = () => {
 
     // Cleanup function
     return () => unsubscribeSnapshot();
-  }, [isAuthReady, userId, error]); 
+  }, [isAuthReady, userId, error, isFallback]); 
 
   // --- Data Handlers ---
 
@@ -157,8 +165,8 @@ const App = () => {
   const handleSubmit = async (e) => {
     e.preventDefault();
     // Prevent submission if not ready OR if using the mock config
-    if (isSubmitting || !db || !userId || !isAuthReady || error || firebaseConfig === FALLBACK_FIREBASE_CONFIG) {
-        if (firebaseConfig === FALLBACK_FIREBASE_CONFIG) {
+    if (isSubmitting || !db || !userId || !isAuthReady || error || isFallback) {
+        if (isFallback) {
              setError("Write operation denied: Cannot write to Firestore when using the external mock configuration. Data saving only works inside Canvas.");
         }
         return;
@@ -262,7 +270,7 @@ const App = () => {
         </div>
         <button
           type="submit"
-          disabled={isSubmitting || !isAuthReady || !userId || firebaseConfig === FALLBACK_FIREBASE_CONFIG}
+          disabled={isSubmitting || !isAuthReady || !userId || isFallback}
           className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out disabled:opacity-50"
         >
           {isSubmitting ? (
@@ -273,11 +281,11 @@ const App = () => {
           ) : (
             <>
               <PlusCircle className="w-5 h-5 mr-2" />
-              {firebaseConfig === FALLBACK_FIREBASE_CONFIG ? 'Read-Only Mode' : 'Add Product'}
+              {isFallback ? 'Read-Only Mode' : 'Add Product'}
             </>
           )}
         </button>
-        {firebaseConfig === FALLBACK_FIREBASE_CONFIG && (
+        {isFallback && (
             <p className="text-xs text-red-500 mt-2 p-2 bg-red-50 border border-red-200 rounded-md">
                 This app is in **Read-Only Mode** because it is deployed outside of the Canvas environment. To add products, please use the application within Canvas.
             </p>
@@ -311,7 +319,7 @@ const App = () => {
                 <p className="text-sm text-gray-500 italic">{product.description || 'No description provided.'}</p>
               </div>
               <div className="text-right">
-                <span className="font-bold text-lg text-indigo-600">${product.price.toFixed(2)}</span>
+                <span className="font-bold text-lg text-indigo-600">${product.price ? product.price.toFixed(2) : '0.00'}</span>
                 <span className="block text-xs text-gray-500 bg-gray-200 px-2 py-0.5 rounded-full mt-1">
                   {product.category}
                 </span>
@@ -343,7 +351,7 @@ const App = () => {
 
   // --- Main Render ---
 
-  if (error) {
+  if (error && !isFallback) {
     return (
       <div className="min-h-screen flex items-center justify-center p-4 bg-red-50">
         <div className="bg-white p-6 rounded-lg shadow-xl border-l-4 border-red-500">
