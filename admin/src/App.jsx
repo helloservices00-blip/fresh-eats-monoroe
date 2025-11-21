@@ -1,253 +1,376 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc } from 'firebase/firestore';
-import { PlusCircle, Loader, CheckCircle, XCircle, Users, Key } from 'lucide-react';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, addDoc, onSnapshot, collection, query, serverTimestamp, setLogLevel } from 'firebase/firestore';
+import { Package, PlusCircle, Loader2, DollarSign, List, XCircle, Users } from 'lucide-react';
 
-// --- Global Variable Access ---
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+// ----------------------
+// 1. FIREBASE SETUP
+// ----------------------
+
+// Fallback configuration for external (Render) deployment
+// NOTE: For security in a real application, you would use Render Environment Variables 
+// instead of hardcoding a mock config.
+const FALLBACK_FIREBASE_CONFIG = {
+    apiKey: "MOCK_API_KEY", 
+    authDomain: "mock-auth-domain.firebaseapp.com",
+    projectId: "mock-project-id",
+    storageBucket: "mock-storage-bucket.appspot.com",
+    messagingSenderId: "MOCK_SENDER_ID",
+    appId: "MOCK_APP_ID"
+};
+
+const DEFAULT_APP_ID = 'fresh-eats-admin-dev'; // Used if __app_id is missing
+
+// Check for Canvas variables first, then fallback
+const appId = typeof __app_id !== 'undefined' ? __app_id : DEFAULT_APP_ID;
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-// The main application component
+let firebaseConfig;
+try {
+    firebaseConfig = typeof __firebase_config !== 'undefined' && __firebase_config 
+        ? JSON.parse(__firebase_config) 
+        : FALLBACK_FIREBASE_CONFIG;
+} catch (e) {
+    firebaseConfig = FALLBACK_FIREBASE_CONFIG;
+}
+
+// The collection path for public data (products)
+const getProductCollectionPath = (appId) => `/artifacts/${appId}/public/data/products`;
+
+setLogLevel('error'); // Set log level to reduce console noise unless debugging
+
+let app;
+let db;
+let auth;
+
+// ----------------------
+// 2. MAIN APP COMPONENT
+// ----------------------
+
 const App = () => {
-  const [storeName, setStoreName] = useState('');
-  const [description, setDescription] = useState('');
-  const [category, setCategory] = useState('Food');
-  const [deliveryTime, setDeliveryTime] = useState('30-45');
-  const [rating, setRating] = useState('4.5');
-  
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [message, setMessage] = useState(null); // { type: 'success'|'error', text: '...' }
+  const [products, setProducts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [isAuthReady, setIsAuthReady] = useState(false);
   const [userId, setUserId] = useState(null);
-  const [authReady, setAuthReady] = useState(false);
+  const [error, setError] = useState(null);
+  
+  // State for the new product form
+  const [newProduct, setNewProduct] = useState({
+    name: '',
+    description: '',
+    price: 0,
+    category: 'Main Dish',
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const categories = ['Main Dish', 'Appetizer', 'Dessert', 'Drink'];
 
-  const firebaseRef = useRef({ db: null, auth: null });
 
-  // 1. Initialize Firebase and Authenticate
+  // --- Firebase Initialization and Auth ---
   useEffect(() => {
-    let unsubscribeAuth = () => {};
+    // Check for a usable config before attempting initialization
+    if (!firebaseConfig || !firebaseConfig.projectId) {
+        setError("Initialization Failed: Firebase configuration is missing or invalid.");
+        setIsAuthReady(true);
+        return;
+    }
+    
+    try {
+      app = initializeApp(firebaseConfig);
+      db = getFirestore(app);
+      auth = getAuth(app);
 
-    const initFirebase = async () => {
-      try {
-        if (Object.keys(firebaseConfig).length === 0) {
-          throw new Error("Firebase configuration is missing.");
-        }
-
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        firebaseRef.current = { db, auth };
-
-        // Set up Auth State Listener
-        unsubscribeAuth = onAuthStateChanged(auth, (user) => {
-          if (user) {
-            setUserId(user.uid);
-          } else {
-            setUserId(null);
-          }
-          setAuthReady(true);
-        });
-
-        // Sign in using provided token or anonymously
-        if (initialAuthToken) {
-          await signInWithCustomToken(auth, initialAuthToken);
+      // Listen for auth state changes to set userId and mark ready
+      const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
         } else {
-          await signInAnonymously(auth);
+          // Attempt sign-in if not authenticated
+          try {
+            // Use custom token if provided (e.g., in Canvas), otherwise sign in anonymously
+            if (initialAuthToken) {
+              await signInWithCustomToken(auth, initialAuthToken);
+            } else {
+              await signInAnonymously(auth);
+            }
+          } catch (e) {
+            console.error("Firebase Auth Error:", e);
+            // This is expected if using the mock config, so we set a mock ID
+            setUserId(crypto.randomUUID()); 
+            console.warn("Using mock user ID due to failed auth, which is expected with mock config.");
+          }
         }
+        setIsAuthReady(true);
+      });
 
-      } catch (e) {
-        console.error("Firebase Initialization Error:", e);
-        setMessage({ type: 'error', text: `Initialization Failed: ${e.message}` });
-        setAuthReady(true); 
-      }
-    };
-
-    initFirebase();
-
-    return () => unsubscribeAuth();
+      return () => unsubscribeAuth();
+    } catch (e) {
+      console.error("Firebase Init Error:", e);
+      setError(`Initialization Error: ${e.message}.`);
+      setIsAuthReady(true); 
+    }
   }, []);
+
+  // --- Firestore Listener ---
+  useEffect(() => {
+    // Only proceed if Firebase is initialized and Auth is ready
+    if (!isAuthReady || !db || !userId || error) return;
+
+    const productsRef = collection(db, getProductCollectionPath(appId));
+    const productsQuery = query(productsRef);
+
+    // Set up real-time listener for products
+    const unsubscribeSnapshot = onSnapshot(productsQuery, (snapshot) => {
+      try {
+        const productList = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+        setProducts(productList.sort((a, b) => (b.createdAt?.toMillis() || 0) - (a.createdAt?.toMillis() || 0)));
+        setLoading(false);
+      } catch (e) {
+        console.error("Firestore Snapshot Error:", e);
+        // This often happens if security rules are too restrictive for anonymous users
+        setError(`Data fetch failed: ${e.message}. Please verify Firestore rules.`);
+        setLoading(false);
+      }
+    }, (e) => {
+      console.error("onSnapshot failed:", e);
+      setError(`Real-time data error: ${e.message}. Please verify Firestore rules.`);
+      setLoading(false);
+    });
+
+    // Cleanup function
+    return () => unsubscribeSnapshot();
+  }, [isAuthReady, userId, error]); 
+
+  // --- Data Handlers ---
+
+  const handleInputChange = (e) => {
+    const { name, value, type } = e.target;
+    setNewProduct(prev => ({
+      ...prev,
+      [name]: type === 'number' ? parseFloat(value) || 0 : value
+    }));
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!authReady || !firebaseRef.current.db) {
-      setMessage({ type: 'error', text: 'Application is not fully initialized. Please wait.' });
-      return;
-    }
-    if (!userId) {
-       setMessage({ type: 'error', text: 'User is not authenticated. Cannot submit store.' });
-       return;
+    // Prevent submission if not ready OR if using the mock config
+    if (isSubmitting || !db || !userId || !isAuthReady || error || firebaseConfig === FALLBACK_FIREBASE_CONFIG) {
+        if (firebaseConfig === FALLBACK_FIREBASE_CONFIG) {
+             setError("Write operation denied: Cannot write to Firestore when using the external mock configuration. Data saving only works inside Canvas.");
+        }
+        return;
     }
     
-    // Clear previous messages
-    setMessage(null);
+    if (!newProduct.name || newProduct.price <= 0) {
+      setError("Product name is required and price must be greater than 0.");
+      return;
+    }
+    setError(null);
     setIsSubmitting(true);
 
-    const newStoreData = {
-      name: storeName,
-      description: description,
-      category: category,
-      deliveryTime: deliveryTime,
-      rating: parseFloat(rating),
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-
     try {
-      // The document ID is generated by the current timestamp for simplicity
-      const docId = `store_${Date.now()}`;
-      const collectionPath = `artifacts/${appId}/public/data/stores`;
-      const storeDocRef = doc(firebaseRef.current.db, collectionPath, docId);
-
-      await setDoc(storeDocRef, newStoreData);
-
-      setMessage({ type: 'success', text: `Store "${storeName}" created successfully! It is now visible in the Client App.` });
-      // Reset form
-      setStoreName('');
-      setDescription('');
-      setIsSubmitting(false);
-
-    } catch (e) {
-      console.error("Firestore Write Error:", e);
-      // This is where the security rule denial error will be caught if the user lacks the 'admin_user' role
-      setMessage({ 
-        type: 'error', 
-        text: `Write Failed. Ensure you have the 'admin_user' role in Firestore. Error: ${e.message}` 
+      const collectionPath = getProductCollectionPath(appId);
+      await addDoc(collection(db, collectionPath), {
+        ...newProduct,
+        price: parseFloat(newProduct.price.toFixed(2)), 
+        available: true,
+        createdAt: serverTimestamp(),
+        createdBy: userId,
       });
+
+      setNewProduct({ name: '', description: '', price: 0, category: 'Main Dish' });
+    } catch (e) {
+      console.error("Error adding document: ", e);
+      setError(`Failed to add product: ${e.message}. Check your Firebase rules.`);
+    } finally {
       setIsSubmitting(false);
     }
   };
 
-  const categories = ['Food', 'Grocery', 'Beverage', 'Pharmacy', 'Other'];
+  // --- Render Functions ---
 
-  return (
-    <div className="min-h-screen bg-gray-100 font-sans p-4">
-      <header className="bg-white shadow-lg rounded-xl p-5 mb-6 max-w-4xl mx-auto">
-        <div className="flex justify-between items-center">
-          <h1 className="text-3xl font-extrabold text-indigo-700 flex items-center">
-            <Users className="w-6 h-6 mr-3" /> Admin Dashboard
-          </h1>
-          <div className="text-sm text-gray-600">
-            <p className="font-semibold">App ID: {appId}</p>
-            <p>User ID: {userId || 'N/A'}</p>
-          </div>
+  const renderProductForm = () => (
+    <div className="bg-white p-6 rounded-lg shadow-xl border border-gray-100">
+      <h2 className="flex items-center text-xl font-bold text-gray-700 mb-4 border-b pb-2">
+        <PlusCircle className="w-5 h-5 mr-2 text-indigo-500" />
+        Add New Menu Item
+      </h2>
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div>
+          <label htmlFor="name" className="block text-sm font-medium text-gray-700">Name</label>
+          <input
+            type="text"
+            id="name"
+            name="name"
+            value={newProduct.name}
+            onChange={handleInputChange}
+            placeholder="e.g., Spicy Tuna Roll"
+            required
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border focus:ring-indigo-500 focus:border-indigo-500"
+          />
         </div>
-      </header>
-
-      <main className="max-w-4xl mx-auto">
-        <div className="mb-6 p-4 rounded-lg shadow-md bg-yellow-50 border border-yellow-300">
-          <div className="flex items-center text-yellow-800">
-            <Key className="w-5 h-5 mr-2" />
-            <p className="text-sm font-medium">
-              **SECURITY NOTE:** Store creation requires the 'admin\_user' role in Firestore. If the write fails, you must ensure your User ID ({userId || '...'}) has the required role document created under its private space: `artifacts/{appId}/users/{userId}/roles/admin_user`.
-            </p>
-          </div>
+        <div>
+          <label htmlFor="description" className="block text-sm font-medium text-gray-700">Description</label>
+          <textarea
+            id="description"
+            name="description"
+            value={newProduct.description}
+            onChange={handleInputChange}
+            rows="3"
+            placeholder="A brief description of the dish."
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border focus:ring-indigo-500 focus:border-indigo-500"
+          ></textarea>
         </div>
-        
-        <div className="bg-white p-8 rounded-xl shadow-2xl">
-          <h2 className="text-2xl font-bold text-gray-800 mb-6 flex items-center">
-            <PlusCircle className="w-5 h-5 mr-2 text-green-600" /> Create New Store Entry
-          </h2>
-
-          {/* Submission Message */}
-          {message && (
-            <div className={`p-4 rounded-lg mb-6 flex items-center ${
-              message.type === 'success' 
-                ? 'bg-green-100 text-green-800 border border-green-300' 
-                : 'bg-red-100 text-red-800 border border-red-300'
-            }`}>
-              {message.type === 'success' ? <CheckCircle className="w-5 h-5 mr-3" /> : <XCircle className="w-5 h-5 mr-3" />}
-              <p className="font-medium">{message.text}</p>
-            </div>
-          )}
-
-          <form onSubmit={handleSubmit} className="space-y-6">
-            <div>
-              <label htmlFor="storeName" className="block text-sm font-medium text-gray-700 mb-1">Store Name</label>
+        <div className="flex space-x-4">
+          <div className="flex-1">
+            <label htmlFor="price" className="block text-sm font-medium text-gray-700">Price (USD)</label>
+            <div className="relative mt-1 rounded-md shadow-sm">
+              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                <DollarSign className="h-5 w-5 text-gray-400" />
+              </div>
               <input
-                id="storeName"
-                type="text"
-                value={storeName}
-                onChange={(e) => setStoreName(e.target.value)}
+                type="number"
+                id="price"
+                name="price"
+                value={newProduct.price}
+                onChange={handleInputChange}
+                step="0.01"
+                min="0.01"
                 required
-                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
-                placeholder="e.g., Tasty Bites Restaurant"
+                className="block w-full rounded-md pl-10 pr-2 border border-gray-300 p-2 focus:ring-indigo-500 focus:border-indigo-500"
               />
             </div>
-
-            <div>
-              <label htmlFor="description" className="block text-sm font-medium text-gray-700 mb-1">Description</label>
-              <textarea
-                id="description"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                required
-                rows="3"
-                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
-                placeholder="A short description of the store or its specialty."
-              ></textarea>
-            </div>
-            
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
-              <div>
-                <label htmlFor="category" className="block text-sm font-medium text-gray-700 mb-1">Category</label>
-                <select
-                  id="category"
-                  value={category}
-                  onChange={(e) => setCategory(e.target.value)}
-                  className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150 bg-white"
-                >
-                  {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
-                </select>
-              </div>
-
-              <div>
-                <label htmlFor="rating" className="block text-sm font-medium text-gray-700 mb-1">Rating (e.g., 4.5)</label>
-                <input
-                  id="rating"
-                  type="number"
-                  step="0.1"
-                  min="0"
-                  max="5"
-                  value={rating}
-                  onChange={(e) => setRating(e.target.value)}
-                  required
-                  className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
-                />
-              </div>
-              
-              <div>
-                <label htmlFor="deliveryTime" className="block text-sm font-medium text-gray-700 mb-1">Delivery Time (min)</label>
-                <input
-                  id="deliveryTime"
-                  type="text"
-                  value={deliveryTime}
-                  onChange={(e) => setDeliveryTime(e.target.value)}
-                  required
-                  className="w-full p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
-                  placeholder="e.g., 30-45"
-                />
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={isSubmitting || !authReady || !userId}
-              className={`w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-lg shadow-xl text-lg font-semibold text-white transition duration-200 ${
-                isSubmitting || !userId ? 'bg-indigo-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50'
-              }`}
+          </div>
+          <div className="flex-1">
+            <label htmlFor="category" className="block text-sm font-medium text-gray-700">Category</label>
+            <select
+              id="category"
+              name="category"
+              value={newProduct.category}
+              onChange={handleInputChange}
+              required
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border focus:ring-indigo-500 focus:border-indigo-500"
             >
-              {isSubmitting ? (
-                <>
-                  <Loader className="w-5 h-5 mr-3 animate-spin" /> Submitting...
-                </>
-              ) : (
-                <>
-                  <PlusCircle className="w-5 h-5 mr-2" /> Add Store to Catalog
-                </>
-              )}
-            </button>
-          </form>
+              {categories.map(cat => (
+                <option key={cat} value={cat}>{cat}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <button
+          type="submit"
+          disabled={isSubmitting || !isAuthReady || !userId || firebaseConfig === FALLBACK_FIREBASE_CONFIG}
+          className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out disabled:opacity-50"
+        >
+          {isSubmitting ? (
+            <>
+              <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+              Saving...
+            </>
+          ) : (
+            <>
+              <PlusCircle className="w-5 h-5 mr-2" />
+              {firebaseConfig === FALLBACK_FIREBASE_CONFIG ? 'Read-Only Mode' : 'Add Product'}
+            </>
+          )}
+        </button>
+        {firebaseConfig === FALLBACK_FIREBASE_CONFIG && (
+            <p className="text-xs text-red-500 mt-2 p-2 bg-red-50 border border-red-200 rounded-md">
+                This app is in **Read-Only Mode** because it is deployed outside of the Canvas environment. To add products, please use the application within Canvas.
+            </p>
+        )}
+      </form>
+    </div>
+  );
+
+  const renderProductList = () => (
+    <div className="bg-white p-6 rounded-lg shadow-xl border border-gray-100">
+      <h2 className="flex items-center text-xl font-bold text-gray-700 mb-4 border-b pb-2">
+        <List className="w-5 h-5 mr-2 text-emerald-500" />
+        Current Menu Items ({products.length})
+      </h2>
+      {loading ? (
+        <div className="text-center py-8 text-gray-500">
+          <Loader2 className="w-6 h-6 mx-auto mb-2 animate-spin" />
+          Loading products...
+        </div>
+      ) : products.length === 0 ? (
+        <div className="text-center py-8 text-gray-500 border-2 border-dashed border-gray-200 rounded-md">
+          <Package className="w-8 h-8 mx-auto mb-2" />
+          No products added yet.
+        </div>
+      ) : (
+        <ul className="space-y-3">
+          {products.map((product) => (
+            <li key={product.id} className="p-3 border rounded-md hover:bg-gray-50 transition duration-100 flex justify-between items-center">
+              <div>
+                <p className="font-semibold text-gray-800">{product.name}</p>
+                <p className="text-sm text-gray-500 italic">{product.description || 'No description provided.'}</p>
+              </div>
+              <div className="text-right">
+                <span className="font-bold text-lg text-indigo-600">${product.price.toFixed(2)}</span>
+                <span className="block text-xs text-gray-500 bg-gray-200 px-2 py-0.5 rounded-full mt-1">
+                  {product.category}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+
+  const renderHeader = () => (
+    <header className="bg-white shadow-md p-4 mb-8 sticky top-0 z-10">
+      <div className="max-w-7xl mx-auto flex justify-between items-center">
+        <div className="flex items-center space-x-2">
+          <Package className="w-8 h-8 text-indigo-600" />
+          <h1 className="text-2xl font-extrabold text-gray-800">Fresh Eats Admin Panel</h1>
+        </div>
+        <div className="text-sm text-gray-600 flex items-center space-x-2">
+          <Users className="w-4 h-4 text-gray-500" />
+          <span>Admin User:</span>
+          <span className="font-mono text-xs bg-gray-100 p-1 rounded break-all">
+            {userId || 'Mock ID...'}
+          </span>
+        </div>
+      </div>
+    </header>
+  );
+
+  // --- Main Render ---
+
+  if (error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4 bg-red-50">
+        <div className="bg-white p-6 rounded-lg shadow-xl border-l-4 border-red-500">
+          <h2 className="flex items-center text-xl font-bold text-red-600 mb-2">
+            <XCircle className="w-6 h-6 mr-2" />
+            Application Error
+          </h2>
+          <p className="text-gray-700">{error}</p>
+          <p className="text-sm mt-4 text-red-500">
+            If this error persists, there may be an issue with Firebase rules or service availability.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {renderHeader()}
+      <main className="max-w-7xl mx-auto px-4 pb-12">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          <div className="lg:col-span-1">
+            {renderProductForm()}
+          </div>
+          <div className="lg:col-span-2">
+            {renderProductList()}
+          </div>
         </div>
       </main>
     </div>
